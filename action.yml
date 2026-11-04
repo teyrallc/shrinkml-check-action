@@ -1,0 +1,124 @@
+name: ShrinkML check
+description: >-
+  Fails the job when a model version would not pass ShrinkML's promotion check (at least 80%, strictly better than
+  the active version, on the same Holdout). It only asks; it never changes anything in your project.
+author: Teyra LLC
+branding:
+  icon: check-circle
+  color: blue
+
+inputs:
+  project-id:
+    description: The ShrinkML project id (the uuid in the project page's address).
+    required: true
+  api-key:
+    description: >-
+      A ShrinkML API key. Use a READ-ONLY key (Settings, API Keys, access "read"): this action only reads. Pass it
+      from a repository secret, never as plain text.
+    required: true
+  candidate:
+    description: >-
+      The version to check: the folder or zip of a Package (as `shrinkml package pull` leaves it), a version number
+      such as v3, or a version id.
+    required: true
+  baseline:
+    description: >-
+      Path of a baseline file (written by `shrinkml check --write-baseline`) to compare with as well. Leave empty to
+      use shrinkml.baseline.json in the working folder when it exists.
+    required: false
+    default: ''
+  baseline-only:
+    description: >-
+      Set to "true" to compare with the baseline file only, not with the version that is active now.
+    required: false
+    default: 'false'
+  base-url:
+    description: The ShrinkML API address. Leave empty for the default.
+    required: false
+    default: ''
+  language:
+    description: Language of the words in the log, "en" or "zh-Hant".
+    required: false
+    default: 'en'
+  cli-package:
+    description: >-
+      What to install the ShrinkML command-line tool from. The default is the published package; a path or a URL to
+      a wheel also works.
+    required: false
+    default: 'shrinkml-cli'
+
+outputs:
+  passed:
+    description: '"true" when the version would pass the check, "false" when it would not.'
+    value: ${{ steps.check.outputs.passed }}
+  result-file:
+    description: Path of the JSON the check wrote (the same shape as `shrinkml check --json`).
+    value: ${{ steps.check.outputs.result-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install the ShrinkML command-line tool
+      shell: bash
+      env:
+        CLI_PACKAGE: ${{ inputs.cli-package }}
+      run: |
+        set -euo pipefail
+        python3 -m pip install --user --disable-pip-version-check --quiet -- "$CLI_PACKAGE"
+        echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+
+    - name: Ask the promotion check
+      id: check
+      shell: bash
+      env:
+        # Inputs reach the script only through the environment, never pasted into it: no input can become a command.
+        SHRINKML_API_KEY: ${{ inputs.api-key }}
+        SHRINKML_BASE_URL: ${{ inputs.base-url }}
+        SHRINKML_LANG: ${{ inputs.language }}
+        SML_PROJECT_ID: ${{ inputs.project-id }}
+        SML_CANDIDATE: ${{ inputs.candidate }}
+        SML_BASELINE: ${{ inputs.baseline }}
+        SML_BASELINE_ONLY: ${{ inputs.baseline-only }}
+      run: |
+        set -uo pipefail
+        if [ -z "$SHRINKML_BASE_URL" ]; then unset SHRINKML_BASE_URL; fi
+        result="${RUNNER_TEMP:-/tmp}/shrinkml-check.json"
+        args=(check --project "$SML_PROJECT_ID" --candidate "$SML_CANDIDATE" --json)
+        if [ -n "$SML_BASELINE" ]; then args+=(--baseline "$SML_BASELINE"); fi
+        if [ "$SML_BASELINE_ONLY" = "true" ]; then args+=(--baseline-only); fi
+        shrinkml "${args[@]}" > "$result"
+        code=$?
+        echo "result-file=$result" >> "$GITHUB_OUTPUT"
+        python3 - "$result" "$code" <<'PY'
+        import json, os, sys
+
+        path, code = sys.argv[1], int(sys.argv[2])
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = None
+        lines = []
+        if data is not None:
+            word = "PASS" if data["passed"] else "FAIL"
+            cand = data["candidate"]
+            lines.append(f"ShrinkML check: {word} for version v{cand['version']}")
+            lang = os.environ.get("SHRINKML_LANG") or "en"
+            lang = "zh-Hant" if lang.lower().replace("_", "-").startswith("zh") else "en"
+            for item in data["comparisons"]:
+                lines.append(f"- against the {item['against']}: {item['sentence'].get(lang) or item['sentence']['en']}")
+            passed = "true" if data["passed"] else "false"
+        else:
+            lines.append("ShrinkML check: the check did not run; read the lines above for why.")
+            passed = "false"
+        for line in lines:
+            print(line)
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"passed={passed}\n")
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as out:
+                out.write("\n".join(lines) + "\n")
+        sys.exit(0)
+        PY
+        exit "$code"
